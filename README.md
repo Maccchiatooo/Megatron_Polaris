@@ -7,7 +7,10 @@ pretraining run that actually steps and reduces loss.
 
 This is written as a **troubleshooting guide** rather than polished documentation. The
 goal is to save the next person the half-day of environment debugging that this took,
-especially the parts where the obvious approach silently fails.
+especially the parts where the obvious approach silently fails. It then walks through a
+set of single-node parallelism experiments (TP, PP, TP+PP, and MoE expert parallelism)
+on 4 A100s, focused on *observing* what each strategy does rather than training anything
+real.
 
 > **Scope note.** Everything below was verified on Polaris in May 2026 with the
 > `conda/2025-09-25` module and a recent Megatron-LM checkout (`megatron-core 0.18.0`).
@@ -308,6 +311,128 @@ These are the knobs you turn to start exploring parallelism (tensor/pipeline/exp
 
 ---
 
+## Parallelism experiments
+
+Once the single-GPU run works, the interesting part is watching how Megatron's
+parallelism strategies split the same model across the 4 A100s. Each experiment below is
+just the single-GPU script with a few flags changed — the point is to *observe* the
+difference, not to train anything useful.
+
+All runs use the same toy model (4 layers, hidden 512, 8 heads), the same data, and 20
+iterations. Loss stays equivalent across every configuration (~10.8 → ~6, zero NaN
+iterations), which confirms these are all the *same computation* distributed differently —
+not different training.
+
+> **Read the speed numbers with care.** The per-iteration times below are from a *toy*
+> model where communication overhead dominates everything. They are useful for seeing
+> *that* each strategy has a different cost profile, but you cannot extrapolate them to
+> real models. On a real large model the relative ordering changes completely — e.g. "PP
+> looked faster than TP here" is an artifact of the toy scale, not a general truth.
+
+### Tensor parallelism (TP=4)
+
+Splits each layer's weight matrices across GPUs. Every GPU holds all 4 layers but only a
+slice of each. Changed flags: `--nproc_per_node 4`, `--tensor-model-parallel-size 4`.
+
+What the logs showed:
+
+- `> initialized tensor model parallel with size 4`
+- All 4 ranks hold **identical** parameter counts (each ~1/4 of the single-GPU total).
+  TP splits every layer evenly, so the load is symmetric.
+- Memory dropped to ~1/4 per GPU vs single-GPU.
+- Communication is an all-reduce on **every layer** — frequent and heavy. This is why TP
+  is normally kept *within* a node (NVLink), not across nodes.
+
+### Pipeline parallelism (PP=4)
+
+Splits the model by *depth* — different layers go to different GPUs, and activations are
+relayed down the pipeline. Changed flags: `--nproc_per_node 4`,
+`--pipeline-model-parallel-size 4`.
+
+What the logs showed:
+
+- `> initialized pipeline model parallel with size 4`
+- Parameter counts are now **uneven** across ranks — the stage holding the embedding
+  (first) and the stage holding the output layer (last) are much heavier than the middle
+  stages. PP splits by layer, so whichever stage owns a big component is heavier. This is
+  the visible opposite of TP's symmetry.
+- A new log line appears: `Number of in-flight microbatches: 4` — the pipeline "fill".
+- Per-GPU memory is also uneven, mirroring the parameter split. The heaviest stage
+  becomes the bottleneck, which is why balancing layers across stages matters in practice
+  (`--pipeline-model-parallel-layout`).
+- Communication is sparse (one activation hand-off between stages), unlike TP's
+  per-layer all-reduce.
+
+### Combined TP + PP (TP=2, PP=2)
+
+The 4 GPUs form a 2×2 grid: PP splits the model into two depth-stages, and within each
+stage TP splits each layer in half. Changed flags: `--nproc_per_node 4`,
+`--tensor-model-parallel-size 2`, `--pipeline-model-parallel-size 2`.
+
+What the logs showed — both effects at once, visible in the 2D rank IDs
+`(tensor_rank, pipeline_rank)`:
+
+- Ranks in the **same PP stage** have identical parameter counts (TP's row symmetry).
+- Ranks in **different PP stages** differ (PP's column asymmetry — the embedding stage is
+  heavier).
+- `Number of in-flight microbatches: 2` (matches PP=2).
+
+This is the minimal version of what a real config like the 175B example
+(`TP=8, PP=16`) is doing: TP within a node, PP across nodes.
+
+### MoE + Expert parallelism (EP=4)
+
+A different kind of parallelism, specific to Mixture-of-Experts models. The FFN in each
+layer is replaced by N experts plus a router; each token is routed to only top-k experts
+(sparse activation). EP places different experts on different GPUs. This needs the model
+itself to change, not just the parallel sizes.
+
+Changed flags:
+
+```
+--num-experts 8
+--moe-router-topk 2
+--moe-token-dispatcher-type alltoall
+--moe-grouped-gemm
+--disable-bias-linear
+--expert-model-parallel-size 4
+```
+
+Note `--disable-bias-linear`: with `--moe-grouped-gemm`, Megatron asserts
+`bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True`. Turning
+off the linear bias resolves it — and matches how modern MoE models (Qwen, etc.) are
+built anyway.
+
+What the logs showed — the things that *only* appear with MoE:
+
+- **Total parameters ≠ active parameters.** The toy MoE reported total ~0.10B but active
+  ~0.05B. The model has 8 experts (large total) but each token uses only top-2 (small
+  active compute). This is exactly what the "A3B" in Qwen3-30B-**A3B** means: 30B total,
+  3B active. In every dense run above, total and active were equal.
+- New components in the parameter list: `mlp.router.weight` (decides routing) and
+  `mlp.experts.linear_fc1.weight0 / weight1` (the experts, packed for grouped GEMM).
+- Parameters split into two buckets — non-expert weights (replicated) and expert weights
+  (sharded across the 4 GPUs by EP).
+- A new metric next to the loss: `load_balancing_loss` — the auxiliary loss that
+  discourages the router from overloading a few experts. (Zero here because
+  `--moe-aux-loss-coeff` wasn't set, but its presence marks MoE at work.)
+
+### Summary
+
+| Config | What it splits | Parameter shards | Communication |
+|---|---|---|---|
+| Single GPU | nothing | all on one GPU | none |
+| TP=4 | each layer (width) | identical across GPUs | per-layer all-reduce (frequent) |
+| PP=4 | layers (depth) | uneven across GPUs | activation hand-off (sparse) |
+| TP=2 × PP=2 | both | same within stage, differ across | mix of both |
+| MoE + EP=4 | experts | non-expert replicated, experts sharded | all-to-all token dispatch |
+
+The headline mental model: **TP splits width, PP splits depth, EP splits experts.** TP is
+balanced but communication-heavy; PP is communication-light but unevenly loaded; EP is
+how sparse MoE models scale. Real large-scale configs combine all of them.
+
+---
+
 ## Quick reference
 
 | Thing | Value |
@@ -327,9 +452,14 @@ These are the knobs you turn to start exploring parallelism (tensor/pipeline/exp
 
 To be honest about the edges of this guide:
 
-- Multi-GPU and multi-node runs (tensor/pipeline/expert parallelism). The single-GPU
-  run is confirmed; scaling up is the obvious next step and has its own set of issues
-  (distributed launch, inter-node networking).
+- **Multi-node runs.** Everything above is single-node (4 GPUs). Scaling across nodes
+  (e.g. PP across nodes over Slingshot) is the next step and has its own issues —
+  distributed launch, inter-node networking, multi-node PBS jobs.
+- **Combining all three** (TP + PP + EP together, the full 30B-A3B-style config). Only a
+  limited set of combinations fits on 4 GPUs.
+- **The toy-scale speed numbers** in the parallelism section. They show that each
+  strategy has a *different* cost profile, but the relative ordering does not carry over
+  to real models — see the warning in that section.
 - Whether the `flash-attn 2.8.3` version warning (`Supported flash-attn versions are
   >= 2.1.1, <= 2.8.1`) ever causes real problems. It was only a warning here.
 - Long-term reproducibility across ALCF software refreshes.
